@@ -6,6 +6,8 @@ from datetime import timedelta, datetime
 import asyncio
 
 import pandas as pd
+import pandas.api.types as ptypes
+
 import requests
 
 from intelligent_trading_bot.service.App import *
@@ -24,17 +26,30 @@ async def send_diagram(df, model: dict, config: dict, model_store: ModelStore):
     """
     Produce a line chart based on latest data and send it to the channel.
     """
+    freq = config.get("freq")
+    time_column = config["time_column"]
+
+    df = df.copy()  # Since the dataframe can be changed in-place in this function
+
+    # Ensure that timestamp is in index. It is needed for visualization
+    if not ptypes.is_datetime64_any_dtype(df.index):  # Alternatively df.index.inferred_type == "datetime64"
+        if time_column in df.columns:
+            df = df.set_index('timestamp', inplace=False)
+        else:
+            raise ValueError(f"Neither index nor time columns '{time_column}' are of datetime type")
 
     notification_freq = model.get("notification_freq")
-    freq = config.get("freq")
     if notification_freq:
         # Continue only if system interval start is equal to the (longer) diagram interval start
         if pandas_get_interval(notification_freq)[0] != pandas_get_interval(freq)[0]:
             return
 
     score_column_names = model.get("score_column_names")
-    if isinstance(score_column_names, list) and len(score_column_names) > 0:
-        score_column_names = score_column_names[0]
+    if isinstance(score_column_names, str):
+        score_column_names = [score_column_names]
+    elif isinstance(score_column_names, list) and len(score_column_names) > 1:
+        score_column_names = [score_column_names[0]]
+        log.warning(f"Parameter 'score_column_names' should be one column. Only the first column will be visualized.")
 
     score_thresholds = model.get("score_thresholds")
 
@@ -46,30 +61,46 @@ async def send_diagram(df, model: dict, config: dict, model_store: ModelStore):
     #
     # Prepare data to be visualized
     #
-    # Get main df with high, low, close for the symbol.
     vis_columns = ['open', 'high', 'low', 'close']
-    if score_column_names:
-        vis_columns.append(score_column_names)
+    score_col = score_column_names[0]
+    vis_columns.append(score_col)
+
+    # Generate MAs if necessary
+    score_mas = model.get("score_ma", [])
+    if not isinstance(score_mas, list):
+        score_mas = [score_mas]
+    for ma in score_mas:
+        if not isinstance(ma, int):
+            log.error(f"Parameter 'score_ma' {ma} have to be an integer or a list of integers. Ignore")
+            continue
+        # TODO: Compute moving average column and add it to the list of columns to be visualized
+        ma_column_name = f"{score_col}_{ma}"
+        df[ma_column_name] = df[score_col].rolling(window=ma).mean()
+        vis_columns.append(ma_column_name)
+        score_column_names.append(ma_column_name)
+
+    # Resample
     df_ohlc = df[vis_columns]
-    df_ohlc = resample_ohlc_data(df_ohlc.reset_index(), resampling_freq, nrows, score_column=score_column_names, buy_signal_column=None, sell_signal_column=None)
+    df_ohlc = resample_ohlc_data(df_ohlc.reset_index(), resampling_freq, nrows, score_columns=score_column_names, buy_signal_column=None, sell_signal_column=None)
 
     # Get transaction data
     df_t = load_all_transactions()  # timestamp,price,profit,status
-    df_t['buy_long'] = df_t['status'].apply(lambda x: True if isinstance(x, str) and x == 'BUY' else False)
-    df_t['sell_long'] = df_t['status'].apply(lambda x: True if isinstance(x, str) and x == 'SELL' else False)
-    df_t = df_t[df_t.timestamp >= df_ohlc.timestamp.min()]  # select only transactions for the last time
-    transactions_exist = len(df_t) > 0
-
-    if transactions_exist:
-        df_t = resample_transaction_data(df_t, resampling_freq, 0, 'buy_long', 'sell_long')
-    else:
+    if df_t is None or len(df_t) == 0:
+        transactions_exist = False
         df_t = None
-
-    # Merge because we need signals along with close price in one df
-    if transactions_exist:
-        df = df_ohlc.merge(df_t, how='left', left_on='timestamp', right_on='timestamp')
-    else:
         df = df_ohlc
+    else:
+        df_t['buy_long'] = df_t['status'].apply(lambda x: True if isinstance(x, str) and x == 'BUY' else False)
+        df_t['sell_long'] = df_t['status'].apply(lambda x: True if isinstance(x, str) and x == 'SELL' else False)
+        df_t = df_t[df_t.timestamp >= df_ohlc.timestamp.min()]  # select only transactions for the last time
+        if len(df_t) > 0:
+            transactions_exist = True
+            df_t = resample_transaction_data(df_t, resampling_freq, 0, 'buy_long', 'sell_long')
+            df = df_ohlc.merge(df_t, how='left', left_on='timestamp', right_on='timestamp')
+        else:
+            transactions_exist = False
+            df_t = None
+            df = df_ohlc
 
     symbol = config["symbol"]
     title = f"$\\bf{{{symbol}}}$"
@@ -112,7 +143,7 @@ async def send_diagram(df, model: dict, config: dict, model_store: ModelStore):
         log.error(f"Error sending notification: {e}")
 
 
-def resample_ohlc_data(df, freq, nrows, score_column, buy_signal_column, sell_signal_column):
+def resample_ohlc_data(df, freq, nrows, score_columns, buy_signal_column, sell_signal_column):
     """
     Resample ohlc data to lower frequency. Assumption: time in 'timestamp' column.
     """
@@ -125,9 +156,11 @@ def resample_ohlc_data(df, freq, nrows, score_column, buy_signal_column, sell_si
         'close': 'last',
     }
 
-    # Optional columns
-    if score_column:
-        ohlc[score_column] = lambda x: max(x) if len(x) > 0 and all(x > 0.0) else min(x) if len(x) > 0 and all(x < 0.0) else np.mean(x)
+    if isinstance(score_columns, str):
+        score_columns = [score_columns]
+    for col in score_columns:
+        # Add to aggregations
+        ohlc[col] = lambda x: max(x) if len(x) > 0 and all(x > 0.0) else min(x) if len(x) > 0 and all(x < 0.0) else np.mean(x)
 
     if buy_signal_column:
         # Buy signal if at least one buy signal was during this time interval
@@ -220,7 +253,9 @@ def generate_chart(df, title, buy_signal_column, sell_signal_column, score_colum
     # Transactions (optional): buy or sell triangles over price curve
     #
 
-    triangle_adj = 15
+    # Slightly move the buy/sell triangles so that they exactly point to the price by their corner
+    # Yet, it depends on the price scale (varies for different assets), so set to 0 before a better solution is found
+    triangle_adj = 0
     df["close_buy_adj"] = df["close"] - triangle_adj
     df["close_sell_adj"] = df["close"] + triangle_adj
 
@@ -250,24 +285,39 @@ def generate_chart(df, title, buy_signal_column, sell_signal_column, score_colum
     # Indicator line
     #
 
-    if score_column and score_column in df.columns:
+    if not isinstance(score_column, list):
+        score_column = [score_column]
+
+    main_score_column = score_column[0] if len(score_column) > 0 else None
+
+    if main_score_column and main_score_column in df.columns:
         ax2 = ax1.twinx()
 
-        ymax = max(df[score_column].abs().max(), max(thresholds) if thresholds else 0.0)
+        ymax = max(df[main_score_column].abs().max(), max(thresholds) if thresholds else 0.0)
         ax2.set(ylim=(-ymax * 1.2, +ymax * 1.2))
 
         # ax2.set_frame_on(False)
         ax2.xaxis.grid(True)
 
-        # ax2.axhline(0.0, lw=.1, color="black")
+        ax2.axhline(0.0, lw=.1, color="black")
 
+        # Draw horizontal threshold lines
         for threshold in thresholds:
             ax2.axhline(threshold, lw=3.0, color="lightgray")
 
+        # Draw secondary score columns if any
+        alphas = list(np.arange(1, 0.2, -0.8/len(score_column)))
+        for i, sec_score_col in reversed(list(enumerate(score_column))):
+            if i == 0:
+                continue
+            sns.lineplot(data=df, x="timestamp", y=sec_score_col, drawstyle='default', lw=i, color="violet", alpha=alphas[i], ax=ax2)  # marker="v" "^" , markersize=12
+
+        # Primary score
         # ax2.plot(x, y1, 'o-', color="red" )
-        sns.lineplot(data=df, x="timestamp", y=score_column, drawstyle='steps-mid', lw=1.0, color="red", ax=ax2)  # marker="v" "^" , markersize=12
+        sns.lineplot(data=df, x="timestamp", y=main_score_column, drawstyle='steps-mid', lw=1.0, color="red", ax=ax2)  # marker="v" "^" , markersize=12
         ax2.set_ylabel('Intelligent Indicator', color='r', fontsize=16)
         # ax2.set_ylabel('Score', color='b')
+
 
     # fig.suptitle("My figtitle", fontsize=14)  # Positioned higher
     # plt.title('Weekly: $\\bf{S&P 500}$', fontsize=16)  # , weight='bold' or MathText

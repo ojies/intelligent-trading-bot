@@ -2,8 +2,11 @@ import os
 import sys
 import argparse
 import math, time
-from datetime import datetime
+from datetime import datetime, timedelta
+from dateutil import parser
 from decimal import *
+from typing import Any, Coroutine
+from pathlib import Path
 
 import pandas as pd
 import asyncio
@@ -15,74 +18,76 @@ from binance.enums import *
 
 from intelligent_trading_bot.service.App import *
 from intelligent_trading_bot.common.utils import *
-from intelligent_trading_bot.service.analyzer import *
+from intelligent_trading_bot.inputs.utils_binance import *
 
 import logging
-log = logging.getLogger('collector')
+log = logging.getLogger('binance.base_client')
 
-
-async def main_collector_task():
-    """
-    It is a highest level task which is added to the event loop and executed normally every 1 minute and then it calls other tasks.
-    """
-    symbol = App.config["symbol"]
-    freq = App.config["freq"]
-    start_ts, end_ts = pandas_get_interval(freq)
-    now_ts = now_timestamp()
-
-    log.info(f"===> Start collector task. Timestamp {now_ts}. Interval [{start_ts},{end_ts}].")
-
-    #
-    # 0. Check server state (if necessary)
-    #
-    if data_provider_problems_exist():
-        await data_provider_health_check()
-        if data_provider_problems_exist():
-            log.error(f"Problems with the data provider server found. No signaling, no trade. Will try next time.")
-            return 1
-
-    #
-    # 1. Ensure that we are up-to-date with klines
-    #
-    res = await sync_data_collector_task()
-
-    if res > 0:
-        log.error(f"Problem getting data from the server. No signaling, no trade. Will try next time.")
-        return 1
-
-    log.info(f"<=== End collector task.")
-    return 0
-
+client = None
 
 #
-# Request/update market data
+# Parameters
 #
+append_overlap_records = 5  # How many records to request in addition to the missing data (overlap length)
 
-async def sync_data_collector_task():
+# Binance-specific columns name corresponding to the values returned from API
+column_names = [
+    'timestamp',
+    'open', 'high', 'low', 'close', 'volume',
+    'close_time',
+    'quote_av', 'trades', 'tb_base_av', 'tb_quote_av',
+    'ignore'
+]
+column_types = {
+    'timestamp': 'datetime64[ns, UTC]',  # datetime64[ns, UTC] datetime64[ns]
+    'open': 'float64', 'high': 'float64', 'low': 'float64', 'close': 'float64', 'volume': 'float64',
+    'close_time': 'int64',
+    'quote_av': 'float64', 'trades': 'int64', 'tb_base_av': 'float64', 'tb_quote_av': 'float64',
+    'ignore': 'float64',
+}
+time_column = 'timestamp'
+
+# Useful functions:
+# Ping the server: https://python-binance.readthedocs.io/en/latest/general.html#id1
+# Get system status: https://python-binance.readthedocs.io/en/latest/general.html#id3
+# Check server time and compare with local time: https://python-binance.readthedocs.io/en/latest/general.html#id2
+
+def init_client(parameters, client_args):
+    global client, append_overlap_records
+    append_overlap_records = parameters.get("append_overlap_records", 5)
+    client = Client(**client_args)
+
+def get_client():
+    return client
+
+def close_client():
+    client.close_connection()
+
+async def fetch_klines(config: dict, start_from_dt) -> dict[str, pd.DataFrame] | None:
     """
-    Collect latest data.
-    After executing this task our local (in-memory) data state is up-to-date.
-    Hence, we can do something useful like data analysis and trading.
+    Retrieve and return latest data from binance client.
 
-    Limitations and notes:
-    - Currently, we can work only with one symbol
-    - We update only local state by loading latest data. If it is necessary to initialize the db then another function should be used.
+    Limitation: maximum 999 latest klines can be retrieved. If more is needed then some other function has to be used
+
+    :return: For each symbol (key of the dict), data frame with data and binance-specific columns
     """
 
-    data_sources = App.config.get("data_sources", [])
+    data_sources = config.get("data_sources", [])
     symbols = [x.get("folder") for x in data_sources]
-    freq = App.config["freq"]
+    freq = config["freq"]
     binance_freq = binance_freq_from_pandas(freq)
 
     if not symbols:
-        symbols = [App.config["symbol"]]
+        symbols = [config["symbol"]]
 
-    # How many records are missing (and to be requested) for each symbol
-    missing_klines_counts = [App.analyzer.get_missing_klines_count(sym) for sym in symbols]
+    # Compute how many records need to be fetched from the specified start timestamp
+    intervals_count = get_interval_count_from_start_dt(freq, start_from_dt)
+    request_count = intervals_count + append_overlap_records
 
     # Create a list of tasks for retrieving data
-    #coros = [request_klines(sym, "1m", 5) for sym in symbols]
-    tasks = [asyncio.create_task(request_klines(s, freq, c)) for c, s in zip(missing_klines_counts, symbols)]
+    missing_klines_counts = [request_count for sym in symbols]
+    #coros = [request_symbol_klines(sym, "1m", 5) for sym in symbols]
+    tasks = [asyncio.create_task(request_symbol_klines(s, freq, c)) for c, s in zip(missing_klines_counts, symbols)]
 
     results = {}
     timeout = 10  # Seconds to wait for the result
@@ -92,35 +97,29 @@ async def sync_data_collector_task():
         # Get the results
         res = None
         try:
-            res = await fut
+            res = await fut  # res is dict for symbol, which is a list of record lists of 12 fields
         except TimeoutError as te:
             log.warning(f"Timeout {timeout} seconds when requesting kline data.")
-            return 1
+            return None
         except Exception as e:
             log.warning(f"Exception when requesting kline data.")
-            return 1
+            return None
 
         # Add to the database (will overwrite existing klines if any)
         if res and res.keys():
-            # res is dict for symbol, which is a list of record lists of 12 fields
-            # ==============================
-            # TODO: We need to check these fields for validity (presence, non-null)
-            # TODO: We can load maximum 999 latest klines, so if more 1600, then some other method
-            # TODO: Print somewhere diagnostics about how many lines are in history buffer of db, and if nans are found
             results.update(res)
-            try:
-                added_count = App.analyzer.store_klines(res)
-            except Exception as e:
-                log.error(f"Error storing kline result in the database. Exception: {e}")
-                return 1
         else:
             log.error("Received empty or wrong result from klines request.")
-            return 1
+            return None
 
-    return 0
+    for symbol, klines in results.items():
+        df = klines_to_df(klines)
+        df.name = symbol
+        results[symbol] = df
 
+    return results
 
-async def request_klines(symbol, freq, limit):
+async def request_symbol_klines(symbol, freq, limit: int):
     """
     Request klines data from the service for one symbol.
     Maximum the specified number of klines will be returned.
@@ -144,14 +143,14 @@ async def request_klines(symbol, freq, limit):
             # - startTime: include all intervals (ids) with same or greater id: if within interval then excluding this interval; if is equal to open time then include this interval
             # - endTime: include all intervals (ids) with same or smaller id: if equal to left border then return this interval, if within interval then return this interval
             # - It will return also incomplete current interval (in particular, we could collect approximate klines for higher frequencies by requesting incomplete intervals)
-            klines = App.client.get_klines(symbol=symbol, interval=binance_freq, limit=limit, endTime=now_ts)
+            klines = client.get_klines(symbol=symbol, interval=binance_freq, limit=limit, endTime=now_ts)
             # Return: list of lists, that is, one kline is a list (not dict) with items ordered: timestamp, open, high, low, close etc.
         else:
             # https://sammchardy.github.io/binance/2018/01/08/historical-data-download-binance.html
             # get_historical_klines(symbol, interval, start_str, end_str=None, limit=500)
             # Find start from the number of records and frequency (interval length in milliseconds)
             request_start_ts = now_ts - interval_length_ms * (limit+1)
-            klines = App.client.get_historical_klines(symbol=symbol, interval=binance_freq, start_str=request_start_ts, end_str=now_ts)
+            klines = client.get_historical_klines(symbol=symbol, interval=binance_freq, start_str=request_start_ts, end_str=now_ts)
     except BinanceRequestException as bre:
         # {"code": 1103, "msg": "An unknown parameter was sent"}
         log.error(f"BinanceRequestException while requesting klines: {bre}")
@@ -180,33 +179,169 @@ async def request_klines(symbol, freq, limit):
     # Return all received klines with the symbol as a key
     return {symbol: klines_full}
 
-#
-# Server and account info
-#
-
-
-async def data_provider_health_check():
+async def health_check():
     """
     Request information about the data provider server state.
     """
-    symbol = App.config["symbol"]
-
     # Get server state (ping) and trade status (e.g., trade can be suspended on some symbol)
-    system_status = App.client.get_system_status()
+    system_status = client.get_system_status()
     #{
     #    "status": 0,  # 0: normal，1：system maintenance
     #    "msg": "normal"  # normal or System maintenance.
     #}
-    if not system_status or system_status.get("status") != 0:
-        App.server_status = 1
+    if not system_status:
+        log.error(f"Error connecting to Binance server. No status information.")
         return 1
-    App.server_status = 0
+    if system_status.get("status") != 0:
+        log.error(f"Error connecting to Binance server. Bad status: {system_status.get("status")}")
+        return 1
 
-    # Ping the server
-
-    # Check time synchronization
-    #server_time = App.client.get_server_time()
+    # Check time synchronization (difference betweeen server and local time)
+    #server_time = client.get_server_time()
     #time_diff = int(time.time() * 1000) - server_time['serverTime']
     # TODO: Log large time differences (or better trigger time synchronization procedure)
 
     return 0
+
+def klines_to_df(klines: list):
+    """
+    Convert a list of klines (for one symbol) to a data frame by using the binance-specific convention for (a sequence of) column names and their types.
+    """
+    df = pd.DataFrame(klines, columns=column_names)
+    df[time_column] = pd.to_datetime(df[time_column], unit='ms', utc=True)
+    df = df.astype(column_types)
+
+    # Explicitly assign or convert time zone not needed because we convert millis directly to UTC
+    #if df[time_column].dt.tz is None:
+    #    df[time_column] = df[time_column].dt.tz_localize('UTC')
+    #else:
+    #    df[time_column] = df[time_column].dt.tz_convert('UTC')
+
+    #df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
+
+    #df["open"] = pd.to_numeric(df["open"])
+    #df["high"] = pd.to_numeric(df["high"])
+    #df["low"] = pd.to_numeric(df["low"])
+    #df["close"] = pd.to_numeric(df["close"])
+    #df["volume"] = pd.to_numeric(df["volume"])
+
+    #df["quote_av"] = pd.to_numeric(df["quote_av"])
+    #df["trades"] = pd.to_numeric(df["trades"])
+    #df["tb_base_av"] = pd.to_numeric(df["tb_base_av"])
+    #df["tb_quote_av"] = pd.to_numeric(df["tb_quote_av"])
+
+    # Set index by retaining the time column
+    df.set_index(time_column, inplace=True, drop=False)
+
+    # Validate
+    if df.isnull().any().any():
+        null_columns = {k: v for k, v in df.isnull().any().to_dict().items() if v}
+        print(f"WARNING: Null in raw data found during conversion. Columns with Nulls: {null_columns}")
+    # TODO: We might receive empty strings or 0s in numeric data - how can we detect them?
+    # TODO: Check that timestamps in 'close_time' are strictly consecutive. It is warning - not error
+
+    return df
+
+def download_klines(config, data_sources):
+    """
+    Retrieving historic klines from binance server.
+
+    Client.get_historical_klines
+    """
+    time_column = config["time_column"]
+    data_path = Path(config["data_folder"])
+    download_max_rows = config.get("download_max_rows", 0)
+
+    now = datetime.now()
+
+    freq = config["freq"]  # Pandas frequency
+    print(f"Pandas frequency: {freq}")
+
+    freq = binance_freq_from_pandas(freq)
+    print(f"Binance frequency: {freq}")
+
+    client_args = config.get("client_args", {})
+    if config.get("api_key"):
+        client_args["api_key"] = config.get("api_key")
+    if config.get("api_secret"):
+        client_args["api_secret"] = config.get("api_secret")
+
+    # Create binance client to be used for data retrieval
+    client = Client(**client_args)
+
+    futures = False
+    if futures:
+        client.API_URL = "https://fapi.binance.com/fapi"
+        client.PRIVATE_API_VERSION = "v1"
+        client.PUBLIC_API_VERSION = "v1"
+
+    for ds in data_sources:
+        # Assumption: folder name is equal to the symbol name we want to download
+        quote = ds.get("folder")
+        if not quote:
+            print(f"ERROR. Folder is not specified.")
+            continue
+
+        print(f"Start downloading '{quote}' ...")
+
+        file_path = data_path / quote
+        file_path.mkdir(parents=True, exist_ok=True)  # Ensure that folder exists
+
+        file_name = (file_path / ("futures" if futures else "klines")).with_suffix(".csv")
+
+        # Get a few latest klines to determine the latest available timestamp
+        latest_klines = client.get_klines(symbol=quote, interval=freq, limit=5)
+        latest_ts = pd.to_datetime(latest_klines[-1][0], unit='ms', utc=True)
+
+        if file_name.is_file():
+            # Load the existing data in order to append newly downloaded data
+            df = pd.read_csv(file_name)
+            df[time_column] = pd.to_datetime(df[time_column], format='ISO8601', utc=True)
+            df = df.astype(column_types)
+            df = df.set_index('timestamp', inplace=False, drop=False)
+
+            # oldest_point = parser.parse(data["timestamp"].iloc[-1])
+            oldest_point = df["timestamp"].iloc[-5]  # Use an older point so that new data will overwrite old data
+
+            print(f"File found. Downloaded data for {quote} and {freq} since {str(latest_ts)} will be appended to the existing file {file_name}")
+        else:
+            # No existing data so we will download all available data and store as a new file
+            df = None
+
+            oldest_point = datetime(2017, 1, 1)
+
+            print(f"File not found. All data will be downloaded and stored in newly created file for {quote} and {freq}.")
+
+        #delta_minutes = (latest_ts - oldest_point).total_seconds() / 60
+        #binsizes = {"1m": 1, "5m": 5, "1h": 60, "1d": 1440}
+        #delta_lines = math.ceil(delta_minutes / binsizes[freq])
+
+        # === Download from the remote server using binance client
+        klines = client.get_historical_klines(
+            symbol=quote,
+            interval=freq,
+            start_str=oldest_point.isoformat(),
+            #end_str=latest_ts.isoformat()  # fetch everything up to now
+        )
+
+        df_new = klines_to_df(klines)
+
+        if df is None:
+            df = df_new
+        else:
+            df = pd.concat([df, df_new])
+
+            # Drop duplicates
+            df = df.drop_duplicates(subset=["timestamp"], keep="last")
+            # df = df[~df.index.duplicated(keep='last')]  # alternatively, drop duplicates in index
+
+        # Remove last row because it represents a non-complete kline (the interval not finished yet)
+        df = df.iloc[:-1]
+
+        # Limit the saved size by only the latest rows
+        if download_max_rows:
+            df = df.tail(download_max_rows)
+
+        df.to_csv(file_name, index=False)
+
+        print(f"Finished downloading '{quote}'. Stored {len(df)} rows in '{file_name}'")

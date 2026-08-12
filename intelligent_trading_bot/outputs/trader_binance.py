@@ -16,6 +16,7 @@ from binance.enums import *
 from intelligent_trading_bot.service.App import *
 from intelligent_trading_bot.common.utils import *
 from intelligent_trading_bot.common.model_store import *
+from intelligent_trading_bot.inputs import collector_binance
 from intelligent_trading_bot.outputs.notifier_trades import get_signal
 
 import logging
@@ -34,7 +35,7 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
     buy_signal_column = model.get("buy_signal_column")
     sell_signal_column = model.get("sell_signal_column")
 
-    signal = get_signal(buy_signal_column, sell_signal_column)
+    signal = get_signal(df, buy_signal_column, sell_signal_column)
     signal_side = signal.get("side")
     close_price = signal.get("close_price")
     close_time = signal.get("close_time")
@@ -166,8 +167,8 @@ async def update_trade_status():
 
     # -----
     try:
-        open_orders = App.client.get_open_orders(symbol=symbol)  # By "open" orders they probably mean "NEW" or "PARTIALLY_FILLED"
-        # orders = App.client.get_all_orders(symbol=symbol, limit=10)
+        open_orders = collector_binance.client.get_open_orders(symbol=symbol)  # By "open" orders they probably mean "NEW" or "PARTIALLY_FILLED"
+        # orders = collector_binance.client.get_all_orders(symbol=symbol, limit=10)
     except Exception as e:
         log.error(f"Binance exception in 'get_open_orders' {e}")
         return
@@ -225,7 +226,7 @@ async def update_order_status():
     # -----
     # Retrieve order from the server
     try:
-        new_order = App.client.get_order(symbol=symbol, orderId=order_id)
+        new_order = collector_binance.client.get_order(symbol=symbol, orderId=order_id)
     except Exception as e:
         log.error(f"Binance exception in 'get_order' {e}")
         return
@@ -244,7 +245,7 @@ async def update_account_balance():
     """Get available assets (as decimal)."""
 
     try:
-        balance = App.client.get_asset_balance(asset=App.config["base_asset"])
+        balance = collector_binance.client.get_asset_balance(asset=App.config["base_asset"])
     except Exception as e:
         log.error(f"Binance exception in 'get_asset_balance' {e}")
         return
@@ -252,7 +253,7 @@ async def update_account_balance():
     App.account_info.base_quantity = Decimal(balance.get("free", "0.00000000"))  # BTC
 
     try:
-        balance = App.client.get_asset_balance(asset=App.config["quote_asset"])
+        balance = collector_binance.client.get_asset_balance(asset=App.config["quote_asset"])
     except Exception as e:
         log.error(f"Binance exception in 'get_asset_balance' {e}")
         return
@@ -283,7 +284,7 @@ async def cancel_order():
     # -----
     try:
         log.info(f"Cancelling order id {order_id}")
-        new_order = App.client.cancel_order(symbol=symbol, orderId=order_id)
+        new_order = collector_binance.client.cancel_order(symbol=symbol, orderId=order_id)
     except Exception as e:
         log.error(f"Binance exception in 'cancel_order' {e}")
         return None
@@ -386,7 +387,7 @@ def execute_order(order: dict):
     if trade_model.get("test_order_before_submit"):
         try:
             log.info(f"Submitting test order: {order}")
-            test_response = App.client.create_test_order(**order)  # Returns {} if ok. Does not check available balances - only trade rules
+            test_response = collector_binance.client.create_test_order(**order)  # Returns {} if ok. Does not check available balances - only trade rules
         except Exception as e:
             log.error(f"Binance exception in 'create_test_order' {e}")
             # TODO: Reset/resync whole account
@@ -401,7 +402,7 @@ def execute_order(order: dict):
         # Submit order
         try:
             log.info(f"Submitting order: {order}")
-            order = App.client.create_order(**order)
+            order = collector_binance.client.create_order(**order)
         except Exception as e:
             log.error(f"Binance exception in 'create_order' {e}")
             return

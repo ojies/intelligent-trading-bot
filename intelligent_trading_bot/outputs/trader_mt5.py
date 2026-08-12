@@ -10,7 +10,8 @@ from intelligent_trading_bot.service.App import *
 from intelligent_trading_bot.common.utils import *
 from intelligent_trading_bot.common.model_store import *
 from intelligent_trading_bot.outputs.notifier_trades import get_signal
-from intelligent_trading_bot.service.mt5 import connect_mt5
+
+from intelligent_trading_bot.inputs.collector_mt5 import connect_mt5
 
 import logging
 
@@ -47,7 +48,7 @@ async def trader_mt5(df: pd.DataFrame, model: dict, config: dict, model_store: M
     buy_signal_column = model.get("buy_signal_column")
     sell_signal_column = model.get("sell_signal_column")
 
-    signal = get_signal(buy_signal_column, sell_signal_column)
+    signal = get_signal(df, buy_signal_column, sell_signal_column)
     signal_side = signal.get("side")
     close_price = signal.get("close_price")
     close_time = signal.get("close_time")

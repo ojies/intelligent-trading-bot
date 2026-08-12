@@ -5,6 +5,8 @@ from datetime import timedelta, datetime
 import asyncio
 
 import pandas as pd
+import pandas.api.types as ptypes
+
 import requests
 
 from intelligent_trading_bot.service.App import *
@@ -44,14 +46,18 @@ async def generate_trader_transaction(df, model: dict, config: dict):
     buy_signal_column = model.get("buy_signal_column")
     sell_signal_column = model.get("sell_signal_column")
 
-    signal = get_signal(buy_signal_column, sell_signal_column)
+    signal = get_signal(df, buy_signal_column, sell_signal_column)
     signal_side = signal.get("side")
     close_price = signal.get("close_price")
     close_time = signal.get("close_time")
 
     # Previous transaction: BUY (we are currently selling) or SELL (we are currently buying)
-    t_status = App.transaction.get("status")
-    t_price = App.transaction.get("price")
+    if not App.transaction:
+        t_status = None
+        t_price = None
+    else:
+        t_status = App.transaction.get("status")
+        t_price = App.transaction.get("price")
     if signal_side == "BUY" and (not t_status or t_status == "SELL"):
         profit = t_price - close_price if t_price else 0.0
         t_dict = dict(timestamp=str(close_time), price=close_price, profit=profit, status="BUY")
@@ -64,7 +70,7 @@ async def generate_trader_transaction(df, model: dict, config: dict):
     # Save this transaction
     App.transaction = t_dict
     with open(transaction_path, 'a+') as f:
-        f.write(",".join([f"{v:.2f}" if isinstance(v, float) else str(v) for v in t_dict.values()]) + "\n")
+        f.write(",".join([f"{v:.6f}" if isinstance(v, float) else str(v) for v in t_dict.values()]) + "\n")
 
     log.info(f"Trade simulator transaction: {t_dict}")
 
@@ -82,7 +88,7 @@ async def send_transaction_message(transaction, config):
     else:
         log.error(f"ERROR: Should not happen")
 
-    message += f" Profit: {profit_percent:.2f}% {profit:.2f}₮*"
+    message += f" Profit: {profit_percent:.2f}% {profit:.4f}₮*"
 
     bot_token = config["telegram_bot_token"]
     chat_id = config["telegram_chat_id"]
@@ -106,8 +112,8 @@ async def send_transaction_message(transaction, config):
         log.error(f"ERROR: Should not happen")
 
     message += f"🔸sum={profit_percent_descr['count'] * profit_percent_descr['mean']:.2f}% 🔸count={int(profit_percent_descr['count'])}\n"
-    message += f"🔸mean={profit_percent_descr['mean']:.2f}% 🔸std={profit_percent_descr['std']:.2f}%\n"
-    message += f"🔸min={profit_percent_descr['min']:.2f}% 🔸median={profit_percent_descr['50%']:.2f}% 🔸max={profit_percent_descr['max']:.2f}%\n"
+    message += f"🔸mean={profit_percent_descr['mean']:.4f}% 🔸std={profit_percent_descr['std']:.4f}%\n"
+    message += f"🔸min={profit_percent_descr['min']:.4f}% 🔸median={profit_percent_descr['50%']:.4f}% 🔸max={profit_percent_descr['max']:.4f}%\n"
 
     try:
         url = 'https://api.telegram.org/bot' + bot_token + '/sendMessage?chat_id=' + chat_id + '&parse_mode=markdown&text=' + message
@@ -173,15 +179,18 @@ async def generate_transaction_stats():
     return profit, profit_percent, profit_descr, profit_percent_descr
 
 
-def get_signal(buy_signal_column, sell_signal_column):
+def get_signal(df, buy_signal_column, sell_signal_column):
     """From the last row, produce and return an object with parameters important for trading."""
     freq = App.config["freq"]
 
-    df = App.df
     row = df.iloc[-1]  # Last row stores the latest values we need
 
-    interval_length = pd.Timedelta(freq).to_pytimedelta()
+    interval_length = freq_to_timedelta(freq)
+
+    if not ptypes.is_datetime64_any_dtype(df.index):  # Alternatively df.index.inferred_type == "datetime64"
+        raise ValueError(f"Index of the data frame must be of datetime type.")
     close_time = row.name + interval_length  # Add interval length because timestamp is start of the interval
+
     close_price = row["close"]
 
     buy_signal = row[buy_signal_column]
@@ -212,6 +221,7 @@ def load_last_transaction():
                 pass
         if line:
             t_dict = dict(zip("timestamp,price,profit,status".split(","), line.strip().split(",")))
+            t_dict["timestamp"] = pd.to_datetime(t_dict["timestamp"], utc=True)
             t_dict["price"] = float(t_dict["price"])
             t_dict["profit"] = float(t_dict["profit"])
             #t_dict = json.loads(line)
@@ -224,8 +234,12 @@ def load_last_transaction():
 
 def load_all_transactions():
     transaction_path = get_transaction_path()
+    if not transaction_path.is_file():
+        log.warning(f"File with transactions does not exit: {transaction_path}")
+        return None
     df = pd.read_csv(transaction_path, names="timestamp,price,profit,status".split(","), header=None)
-    df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601', utc=True)
+    df = df.astype({'timestamp': 'datetime64[ns, UTC]', 'price': 'float64', 'profit': 'float64', 'status': 'str'})
     return df
 
 

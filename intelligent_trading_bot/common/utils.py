@@ -8,13 +8,13 @@ from decimal import *
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.frequencies import to_offset
+
+from sklearn import metrics
 
 from apscheduler.triggers.cron import CronTrigger
 
-from binance.helpers import date_to_milliseconds, interval_to_milliseconds
-
 from intelligent_trading_bot.common.gen_features import *
-
 
 #
 # Decimals
@@ -31,167 +31,19 @@ def to_decimal(value):
     ret = Decimal(str(value)).quantize(rr, rounding=ROUND_DOWN)
     return ret
 
-
 def round_str(value, digits):
     rr = Decimal(1) / (Decimal(10) ** digits)  # Result for 8 digits: 0.00000001
     ret = Decimal(str(value)).quantize(rr, rounding=ROUND_HALF_UP)
     return f"{ret:.{digits}f}"
-
 
 def round_down_str(value, digits):
     rr = Decimal(1) / (Decimal(10) ** digits)  # Result for 8 digits: 0.00000001
     ret = Decimal(str(value)).quantize(rr, rounding=ROUND_DOWN)
     return f"{ret:.{digits}f}"
 
-
 #
-# Binance specific
+# Interval arithmetic (pandas)
 #
-
-def klines_to_df(klines, df):
-
-    data = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
-    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
-    dtypes = {
-        'open': 'float64', 'high': 'float64', 'low': 'float64', 'close': 'float64', 'volume': 'float64',
-        'close_time': 'int64',
-        'quote_av': 'float64',
-        'trades': 'int64',
-        'tb_base_av': 'float64',
-        'tb_quote_av': 'float64',
-        'ignore': 'float64',
-    }
-    data = data.astype(dtypes)
-
-    if df is None or len(df) == 0:
-        df = data
-    else:
-        df = pd.concat([df, data])
-
-    # Drop duplicates
-    df = df.drop_duplicates(subset=["timestamp"], keep="last")
-    #df = df[~df.index.duplicated(keep='last')]  # alternatively, drop duplicates in index
-
-    df.set_index('timestamp', inplace=True)
-
-    return df
-
-
-def binance_klines_to_df(klines: list):
-    """
-    Convert a list of klines to a data frame.
-    """
-    columns = [
-        'timestamp',
-        'open', 'high', 'low', 'close', 'volume',
-        'close_time',
-        'quote_av', 'trades', 'tb_base_av', 'tb_quote_av',
-        'ignore'
-    ]
-
-    df = pd.DataFrame(klines, columns=columns)
-
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
-
-    df["open"] = pd.to_numeric(df["open"])
-    df["high"] = pd.to_numeric(df["high"])
-    df["low"] = pd.to_numeric(df["low"])
-    df["close"] = pd.to_numeric(df["close"])
-    df["volume"] = pd.to_numeric(df["volume"])
-
-    df["quote_av"] = pd.to_numeric(df["quote_av"])
-    df["trades"] = pd.to_numeric(df["trades"])
-    df["tb_base_av"] = pd.to_numeric(df["tb_base_av"])
-    df["tb_quote_av"] = pd.to_numeric(df["tb_quote_av"])
-
-    if "timestamp" in df.columns:
-        df.set_index('timestamp', inplace=True)
-
-    return df
-
-
-def binance_freq_from_pandas(freq: str) -> str:
-    """
-    Map pandas frequency to binance API frequency
-
-    :param freq: pandas frequency https://pandas.pydata.org/docs/user_guide/timeseries.html#timeseries-offset-aliases
-    :return: binance frequency https://developers.binance.com/docs/derivatives/coin-margined-futures/market-data/Kline-Candlestick-Data
-    """
-    if freq.endswith("min"):  # Binance: 1m, 3m, 5m, 15m, 30m
-        freq = freq.replace("min", "m")
-    elif freq.endswith("D"):
-        freq = freq.replace("D", "d")  # Binance: 1d, 3d
-    elif freq.endswith("W"):
-        freq = freq.replace("W", "w")
-    elif freq == "BMS":
-        freq = freq.replace("BMS", "M")
-
-    if len(freq) == 1:
-        freq = "1" + freq
-
-    if not (2 <= len(freq) <= 3) or not freq[:-1].isdigit() or freq[-1] not in ["m", "h", "d", "w", "M"]:
-        raise ValueError(f"Not supported Binance frequency {freq}. It should be one or two digits followed by a character.")
-
-    return freq
-
-
-def binance_get_interval(freq: str, timestamp: int=None):
-    """
-    Return a triple of interval start (including), end (excluding) in milliseconds for the specified timestamp or now
-
-    INFO:
-    https://github.com/sammchardy/python-binance/blob/master/binance/helpers.py
-        interval_to_milliseconds(interval) - binance freq string (like 1m) to millis
-
-    :param freq: binance frequency https://developers.binance.com/docs/derivatives/coin-margined-futures/market-data/Kline-Candlestick-Data
-    :return: tuple of start (inclusive) and end (exclusive) of the interval in millis
-    :rtype: (int, int)
-    """
-    if not timestamp:
-        timestamp = datetime.utcnow()  # datetime.now(timezone.utc)
-    elif isinstance(timestamp, int):
-        timestamp = pd.to_datetime(timestamp, unit='ms').to_pydatetime()
-
-    # Although in 3.6 (at least), datetime.timestamp() assumes a timezone naive (tzinfo=None) datetime is in UTC
-    timestamp = timestamp.replace(microsecond=0, tzinfo=timezone.utc)
-
-    if freq == "1s":
-        start = timestamp.timestamp()
-        end = timestamp + timedelta(seconds=1)
-        end = end.timestamp()
-    elif freq == "5s":
-        reference_timestamp = timestamp.replace(second=0)
-        now_duration = timestamp - reference_timestamp
-
-        freq_duration = timedelta(seconds=5)
-
-        full_intervals_no = now_duration.total_seconds() // freq_duration.total_seconds()
-
-        start = reference_timestamp + freq_duration * full_intervals_no
-        end = start + freq_duration
-
-        start = start.timestamp()
-        end = end.timestamp()
-    elif freq == "1m":
-        timestamp = timestamp.replace(second=0)
-        start = timestamp.timestamp()
-        end = timestamp + timedelta(minutes=1)
-        end = end.timestamp()
-    elif freq == "5m":
-        # Here we need to find 1 h border (or 1 day border) by removing minutes
-        # Then divide (now-1hourstart) by 5 min interval length by finding 5 min border for now
-        print(f"Frequency 5m not implemented.")
-    elif freq == "1h":
-        timestamp = timestamp.replace(minute=0, second=0)
-        start = timestamp.timestamp()
-        end = timestamp + timedelta(hours=1)
-        end = end.timestamp()
-    else:
-        print(f"Unknown frequency.")
-
-    return int(start * 1000), int(end * 1000)
-
 
 def pandas_get_interval(freq: str, timestamp: int=None):
     """
@@ -202,7 +54,7 @@ def pandas_get_interval(freq: str, timestamp: int=None):
     :return: triple (start, end)
     """
     if not timestamp:
-        timestamp = int(datetime.now(pytz.utc).timestamp())  # seconds (10 digits)
+        timestamp = int(datetime.now(timezone.utc).timestamp())  # seconds (10 digits)
         # Alternatively: timestamp = int(datetime.utcnow().replace(tzinfo=pytz.utc).timestamp())
     elif isinstance(timestamp, datetime):
         timestamp = int(timestamp.replace(tzinfo=pytz.utc).timestamp())
@@ -219,9 +71,38 @@ def pandas_get_interval(freq: str, timestamp: int=None):
 
     return int(start*1000), int(end*1000)
 
-
 def pandas_interval_length_ms(freq: str):
-    return int(pd.Timedelta(freq).to_pytimedelta().total_seconds() * 1000)
+    return int(freq_to_timedelta(freq).total_seconds() * 1000)
+
+def get_interval_count_from_start_dt(freq: str, start_dt):
+    """How many whole intervals are from the specified start datetime and now."""
+    interval_length_td = freq_to_timedelta(freq)
+    now = datetime.now(timezone.utc)
+    interval_count = (now - start_dt) // interval_length_td  # How many whole intervals
+    return interval_count + 2
+
+def get_start_dt_for_interval_count(freq: str, interval_count: int):
+    """Start datetime for the specified number of whole intervals back. Result is not aligned with the reaster."""
+    interval_length_td = freq_to_timedelta(freq)
+    period_length_td = interval_length_td * (interval_count + 1)
+    now = datetime.now(timezone.utc)
+    start_dt = (now - period_length_td)
+    return start_dt
+
+def freq_to_timedelta(freq: str):
+    """
+    Given pandas freq string, return its duration (timedelta).
+
+    Offsets: https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases
+
+    to_offset("10min").delta -- works w/o number but does not work with B. delta is deprecated
+    pd.Timedelta(days=1) or pd.Timedelta("h") -- does not work w/o number prefix like "h"
+    datetime.timedelta(minutes=120) -- manually
+    """
+    if freq.endswith("B"):  # Replace by D
+        freq = freq[:-1] + "D"
+
+    return pd.Timedelta(to_offset(freq)).to_pytimedelta()  # or _as_pd_timedelta
 
 #
 # Date and time
@@ -236,41 +117,33 @@ def freq_to_CronTrigger(freq: str):
             trigger = CronTrigger(minute="*/" + freq[:-3], second="1", timezone="UTC")
     elif freq.endswith("h"):
         if freq[:-1] == "1":
-            trigger = CronTrigger(hour="*", minute="0", second="2", timezone="UTC")
+            trigger = CronTrigger(hour="*", minute="0", second="20", timezone="UTC")
         else:
-            trigger = CronTrigger(hour="*/" + freq[:-1], minute="0", second="2", timezone="UTC")
+            trigger = CronTrigger(hour="*/" + freq[:-1], minute="0", second="20", timezone="UTC")
     elif freq.endswith("D"):
         if freq[:-1] == "1":
-            trigger = CronTrigger(day="*", second="5", timezone="UTC")
+            trigger = CronTrigger(day="*", hour="0", minute="1", second="0", timezone="UTC")
         else:
-            trigger = CronTrigger(day="*/" + freq[:-1], second="5", timezone="UTC")
+            trigger = CronTrigger(day="*/" + freq[:-1], hour="0", minute="1", second="0", timezone="UTC")
     elif freq.endswith("W"):
         if freq[:-1] == "1":
-            trigger = CronTrigger(week="*", second="10", timezone="UTC")
+            trigger = CronTrigger(week="*", day_of_week="1", hour="1", minute="0", second="0", timezone="UTC")
         else:
-            trigger = CronTrigger(day="*/" + freq[:-1], second="10", timezone="UTC")
+            trigger = CronTrigger(day="*/" + freq[:-1], day_of_week="1", hour="1", minute="0", second="0", timezone="UTC")
     elif freq.endswith("MS"):
         if freq[:-2] == "1":
-            trigger = CronTrigger(month="*", second="30", timezone="UTC")
+            trigger = CronTrigger(month="*", day="1", hour="1", minute="0", second="0", timezone="UTC")
         else:
-            trigger = CronTrigger(month="*/" + freq[:-1], second="30", timezone="UTC")
+            trigger = CronTrigger(month="*/" + freq[:-1], day="1", hour="1", minute="0", second="0", timezone="UTC")
     else:
         raise ValueError(f"Cannot convert frequency '{freq}' to cron.")
 
     return trigger
 
-
 def now_timestamp():
     """
-    INFO:
-    https://github.com/sammchardy/python-binance/blob/master/binance/helpers.py
-    date_to_milliseconds(date_str) - UTC date string to millis
-
-    :return: timestamp in millis
-    :rtype: int
     """
-    return int(datetime.utcnow().replace(tzinfo=timezone.utc).timestamp() * 1000)
-
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 def find_index(df: pd.DataFrame, date_str: str, column_name: str = "timestamp"):
     """
@@ -299,7 +172,6 @@ def find_index(df: pd.DataFrame, date_str: str, column_name: str = "timestamp"):
 
     return id
 
-
 def notnull_tail_rows(df):
     """Maximum number of tail rows without nulls."""
 
@@ -324,7 +196,7 @@ def resolve_generator_name(gen_name: str):
     Fully qualified name consists of module name and function name separated by a colon,
     for example:  'mod1.mod2.mod3:my_func'.
 
-    Example: fn = resolve_generator_name("common.gen_features_topbot:generate_labels_topbot3")
+    Example: fn = resolve_generator_name("intelligent_trading_bot.common.gen_features_topbot:generate_labels_topbot3")
     """
 
     mod_and_func = gen_name.split(':', 1)
@@ -348,6 +220,9 @@ def resolve_generator_name(gen_name: str):
 
     return func
 
+#
+# Data processing
+#
 
 def double_columns(df, shifts: List[int]):
     """
@@ -364,3 +239,260 @@ def double_columns(df, shifts: List[int]):
     df_out = pd.concat(df_list, axis=1)  # keys=('A', 'B')
 
     return df_out
+
+def append_rows(df, new_df):
+    """
+    Append all rows from the second new data frame to the first old data frame by overwriting existing rows if any.
+
+    Notes:
+    - The rows are appended individually (row-by-row in the loop). If the second (new) data frame is large then this operation might be inefficient.
+    - No validity check are performed like column overlaps or resulting index gaps.
+    - If it is necessary to retain continuous index then additional validations have to be done (before or after this operation).
+    """
+    for idx, row in new_df.iterrows():
+        df.loc[idx] = row
+    return df
+
+def append_df_drop_concat(df, new_df):
+
+    # Drop explicitly last rows in the overlap range
+    #df_wo_overlap = df.drop(new_df.index[:], errors="ignore")  # ignore errors in case of missing indexes (for new rows). Set in_place if necessary
+
+    # Drop explicitly last rows in the overlap range
+    df_wo_overlap = df[:new_df.index[0]]  # Select only records till the first index in the new frame. Assume the rows in the new frame are ordered
+    df_wo_overlap = df_wo_overlap.iloc[:-1]  # Remove last element because slicing above includes the range right side
+
+    # Drop explicitly last rows in the overlap range
+    #last_idx = df.index.get_loc(new_df.index[0])
+    #df_wo_overlap = df.iloc[:last_idx]
+
+    df3 = pd.concat([df_wo_overlap, new_df])  # Append new rows with overlap removed above
+
+    return df3
+
+def append_df_combine_update(df, new_df):
+    # The first old frame has priority and its values will be always retained if available (non-null).
+    # Only if an old value is null or a new row was appended, the new values from new frame is used.
+    # Update null (and only null) elements with values in the same location in other (if any, that is, null is not used for overwriting).
+    df2 = df.combine_first(new_df)
+    # Yet, we want to have new values overwrite even old non-null values so enforce complete overwriting (inplace)
+    df2.update(new_df)
+    return df2
+
+def merge_data_sources(data_sources: list, time_column: str, freq: str, merge_interpolate: bool):
+    """
+    Create one data frame by merging multiple source data frames on the specified time column by generating a common time raster.
+
+    :param data_sources: list of dicts where each dict describes one data source and stores its data in df
+    :param time_column: column name with timestamps
+    :param freq: pandas frequency for the common time raster like 1min, 1h etc.
+    :param merge_interpolate: if True then the missing values will be interpolated
+    :return: data frame with all data merged on timestamps
+    """
+    for ds in data_sources:
+        df = ds.get("df")
+
+        if time_column in df.columns:
+            df = df.set_index(time_column)
+        elif df.index.name == time_column:
+            pass
+        else:
+            print(f"ERROR: Timestamp column is absent.")
+            return
+
+        # Add prefix if not already there
+        if ds['column_prefix']:
+            #df = df.add_prefix(ds['column_prefix']+"_")
+            df.columns = [
+                ds['column_prefix']+"_"+col if not col.startswith(ds['column_prefix']+"_") else col
+                for col in df.columns
+            ]
+
+        ds["start"] = df.first_valid_index()  # df.index[0]
+        ds["end"] = df.last_valid_index()  # df.index[-1]
+
+        ds["df"] = df
+
+    #
+    # Create common (main) index and empty data frame
+    #
+    range_start = min([ds["start"] for ds in data_sources])
+    range_end = min([ds["end"] for ds in data_sources])
+
+    # Generate a discrete time raster according to the (pandas) frequency parameter
+    index = pd.date_range(range_start, range_end, freq=freq)
+
+    df_out = pd.DataFrame(index=index)
+    df_out.index.name = time_column
+    df_out.insert(0, time_column, df_out.index)  # Repeat index as a new column
+
+    for ds in data_sources:
+        # Note that timestamps must have the same semantics, for example, start of kline (and not end of kline)
+        # If different data sets have different semantics for timestamps, then data must be shifted accordingly
+        df_out = df_out.join(ds["df"])
+
+    # Interpolate numeric columns
+    if merge_interpolate:
+        num_columns = df_out.select_dtypes((float, int)).columns.tolist()
+        for col in num_columns:
+            df_out[col] = df_out[col].interpolate()
+
+    return df_out
+
+#
+# Analysis
+#
+
+def compute_scores(y_true, y_hat):
+    """Compute several scores and return them as dict."""
+    y_true = y_true.astype(int)
+    y_hat_class = np.where(y_hat.values > 0.5, 1, 0)
+
+    try:
+        auc = metrics.roc_auc_score(y_true, y_hat.fillna(value=0))
+    except ValueError:
+        auc = 0.0  # Only one class is present (if dataset is too small, e.g,. when debugging) or Nulls in predictions
+
+    try:
+        ap = metrics.average_precision_score(y_true, y_hat.fillna(value=0))
+    except ValueError:
+        ap = 0.0  # Only one class is present (if dataset is too small, e.g,. when debugging) or Nulls in predictions
+
+    f1 = metrics.f1_score(y_true, y_hat_class)
+    precision = metrics.precision_score(y_true, y_hat_class)
+    recall = metrics.recall_score(y_true, y_hat_class)
+
+    scores = dict(auc=auc, ap=ap, f1=f1, precision=precision, recall=recall,)
+
+    scores = {key: round(float(value), 3) for (key, value) in scores.items()}
+
+    return scores
+
+def compute_scores_regression(y_true, y_hat):
+    """Compute regression scores. Input columns must have numeric data type."""
+
+    try:
+        mae = metrics.mean_absolute_error(y_true, y_hat)
+    except ValueError:
+        mae = np.nan
+
+    try:
+        mape = metrics.mean_absolute_percentage_error(y_true, y_hat)
+    except ValueError:
+        mape = np.nan
+
+    try:
+        r2 = metrics.r2_score(y_true, y_hat)
+    except ValueError:
+        r2 = np.nan
+
+    #
+    # How good it is in predicting the sign (increase of decrease)
+    #
+
+    y_true_class = np.where(y_true.values > 0.0, +1, -1)
+    y_hat_class = np.where(y_hat.values > 0.0, +1, -1)
+
+    try:
+        auc = metrics.roc_auc_score(y_true_class, y_hat_class)
+    except ValueError:
+        auc = 0.0  # Only one class is present (if dataset is too small, e.g,. when debugging) or Nulls in predictions
+
+    try:
+        ap = metrics.average_precision_score(y_true_class, y_hat_class)
+    except ValueError:
+        ap = 0.0  # Only one class is present (if dataset is too small, e.g,. when debugging) or Nulls in predictions
+
+    f1 = metrics.f1_score(y_true_class, y_hat_class)
+    precision = metrics.precision_score(y_true_class, y_hat_class)
+    recall = metrics.recall_score(y_true_class, y_hat_class)
+
+    scores = dict(
+        mae=mae, mape=mape, r2=r2,
+        auc=auc, ap=ap, f1=f1, precision=precision, recall=recall,
+    )
+
+    scores = {key: round(float(value), 3) for (key, value) in scores.items()}
+
+    return scores
+
+def first_location_of_crossing_threshold(df, horizon, threshold, close_column_name, price_column_name):
+    """
+    For each point, take its close price as a reference, and then find the distance
+    (relative offset, index) to the _first_ future point with the price higher (or lower)
+    than the reference price by the specified level.
+
+    If the location (relative index) is 0 then it is the next point. If location (index) is NaN,
+    then the price does not cross the specified threshold within the horizon
+    (or there is not enough data, e.g., at the end of the series). Therefore, this
+    function can be used to find whether the price will cross the threshold at all
+    during the specified horizon.
+
+    The function is somewhat similar to the tsfresh function first_location_of_maximum
+    or minimum. The difference is that this function does not search for local maximum
+    (which can vary) but rather finds the first point with the fixed specified increase
+    (or decrease).
+
+    Horizon specifies how many future points are considered (excluding the current point).
+
+    If the specified threshold is positive then the function is searching for increase.
+    Otherwise, if it is negative, then the functions will search for decrease.
+    The threshold is specified as percentage. For example, 2% means that the function
+    will find relative offset (distance from this point) where the price increases by 2%
+    relative to the current price. This will be done for all point.
+
+    :param df: dataframe with the specified columns
+    :param horizon: how many future data rows to consider when searching for the specified price increase or decrease
+    :param threshold: percentage of increase (if positive) or decrease (if negative)
+    :param close_column_name: column for reference (initial) prices
+    :param price_column_name: columns to search for the specified increase or decrease.
+      Frequently, it is high column for price increase and low column for price decrease.
+      But it can be also the reference column (for example, close price) for both cases if we ignore high and low peaks..
+    :return: A series with integer (or None) values. One integer value represent the offset from the current value
+      where the price increases (or decreases) by the specified percentage. None means that the price does not reach
+      the specified level within the horizon.
+    """
+
+    def fn_high(x):
+        if len(x) < 2:
+            return np.nan
+        p = x[0, 0]  # Reference price
+        p_threshold = p*(1+(threshold/100.0))  # Cross line
+        idx = np.argmax(x[1:, 1] > p_threshold)  # First index where price crosses the threshold
+
+        # If all False, then index is 0 (first element of constant series) and we are not able to distinguish it from first element being True
+        # If index is 0 and first element False (under threshold) then NaN (not exceeds)
+        if idx == 0 and x[1, 1] <= p_threshold:
+            return np.nan
+        return idx
+
+    def fn_low(x):
+        if len(x) < 2:
+            return np.nan
+        p = x[0, 0]  # Reference price
+        p_threshold = p*(1+(threshold/100.0))  # Cross line
+        idx = np.argmax(x[1:, 1] < p_threshold)  # First index where price crosses the threshold
+
+        # If all False, then index is 0 (first element of constant series) and we are not able to distinguish it from first element being True
+        # If index is 0 and first element False (under threshold) then NaN (not exceeds)
+        if idx == 0 and x[1, 1] >= p_threshold:
+            return np.nan
+        return idx
+
+    # Window df will include the current row as well as horizon of past rows with 0 index starting from the oldest row and last index with the current row
+    rl = df[[close_column_name, price_column_name]].rolling(horizon + 1, min_periods=(horizon // 2), method='table')
+
+    if threshold > 0:
+        df_out = rl.apply(fn_high, raw=True, engine='numba')
+    elif threshold < 0:
+        df_out = rl.apply(fn_low, raw=True, engine='numba')
+    else:
+        raise ValueError(f"Threshold cannot be zero.")
+
+    # Because rolling apply processes past records while we need future records
+    df_out = df_out.shift(-horizon)
+
+    # For some unknown reason (bug?), rolling apply (with table and numba) returns several columns rather than one column
+    out_column = df_out.iloc[:, 0]
+
+    return out_column

@@ -690,8 +690,11 @@ The output predicted labels will cover shorter period of time because we need so
 def predict_rolling(config_file, in_nrows, max_workers):
     from intelligent_trading_bot.service.App import App
     from intelligent_trading_bot.common.utils import find_index
-    from intelligent_trading_bot.common.classifiers import train_predict_gb, train_predict_nn, train_predict_lc, train_predict_svc
-    from intelligent_trading_bot.common.classifiers import compute_scores, compute_scores_regression
+    from intelligent_trading_bot.common.classifier_gb import train_predict_gb
+    from intelligent_trading_bot.common.classifier_nn import train_predict_nn
+    from intelligent_trading_bot.common.classifier_lc import train_predict_lc
+    from intelligent_trading_bot.common.classifier_svc import train_predict_svc
+    from intelligent_trading_bot.common.utils import compute_scores, compute_scores_regression
     from intelligent_trading_bot.common.model_store import ModelStore, label_algo_separator, score_to_label_algo_pair
 
     config = handle_config(config_file)

@@ -1,7 +1,3 @@
-
-from decimal import *
-import asyncio
-
 import click
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -9,10 +5,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from binance import Client
 
 from intelligent_trading_bot.common.types import Venue
-from intelligent_trading_bot.service.App import *
-from intelligent_trading_bot.common.utils import *
 from intelligent_trading_bot.common.generators import output_feature_set
-from intelligent_trading_bot.service.analyzer import *
+from intelligent_trading_bot.common.analyzer import Analyzer
 
 from intelligent_trading_bot.inputs import get_collector_functions
 
@@ -20,7 +14,6 @@ from intelligent_trading_bot.outputs.notifier_trades import *
 from intelligent_trading_bot.outputs.notifier_scores import *
 from intelligent_trading_bot.outputs.notifier_diagram import *
 from intelligent_trading_bot.outputs import get_trader_functions
-
 
 import logging
 
@@ -45,12 +38,8 @@ async def main_task():
     #
     # 1. Execute input adapters to receive new data from data source(s)
     #
-    venue = App.config.get("venue")
-    venue = Venue(venue)
-    main_collector_task, _, _ = get_collector_functions(venue)
-
     try:
-        res = await main_collector_task()
+        res = await main_collector_task()  # Retrieve raw data, merge, convert to data frame and append
     except Exception as e:
         log.error(f"Error in main_collector_task function: {e}")
         return
@@ -64,9 +53,8 @@ async def main_task():
     #    log.error(f"Problem during analysis. Last kline end ts {last_kline_ts + 60_000} not equal to start of current interval {startTime}.")
 
     #
-    # 2. Apply transformations (merge, features, prediction scores, signals) and generate new data columns
+    # 2. Apply transformations and generate derived columns for the appended data
     #
-
     try:
         analyze_task = await App.loop.run_in_executor(None, App.analyzer.analyze)
     except Exception as e:
@@ -76,17 +64,63 @@ async def main_task():
     #
     # 3. Execute output adapter which send the results of analysis to consumers
     #
-
-    # Execute all output set entries
     output_sets = App.config.get("output_sets", [])
     for os in output_sets:
         try:
-            await output_feature_set(App.df, os, App.config, App.model_store)
+            await output_feature_set(App.analyzer.df, os, App.config, App.model_store)
         except Exception as e:
             log.error(f"Error in output function: {e}")
             return
 
     return
+
+async def main_collector_task():
+    """
+    Retrieve raw data from venue-specific data sources and append to the main data frame
+    """
+    venue = App.config.get("venue")
+    venue = Venue(venue)
+    fetch_klines_fn, health_check_fn = get_collector_functions(venue)
+
+    symbol = App.config["symbol"]
+    freq = App.config["freq"]
+    start_ts, end_ts = pandas_get_interval(freq)
+    now_ts = now_timestamp()
+
+    log.info(f"===> Start collector task. Timestamp {now_ts}. Interval [{start_ts},{end_ts}].")
+
+    #
+    # 1. Check server state (if necessary)
+    #
+    if data_provider_problems_exist():
+        await health_check_fn()
+        if data_provider_problems_exist():
+            log.error(f"Problems with the data provider server found. No signaling, no trade. Will try next time.")
+            return 1
+
+    #
+    # 2. Get how much data is missing and request it
+    #
+    # Ask analyzer what is the timestamp of its last available row
+    last_kline_dt = App.analyzer.get_last_kline_dt()
+
+    # Request data starting from this time (with certain overlap)
+    dfs = await fetch_klines_fn(App.config, last_kline_dt)
+    if dfs is None:
+        log.error(f"Problem getting data from the server. Will try next time.")
+        return 1
+
+    #
+    # 3. Append data to the analyzer for further processing (my also creating a common index and merging)
+    #
+    try:
+        App.analyzer.append_data(dfs)
+    except Exception as e:
+        log.error(f"Error appending data to the analyzer. Exception: {e}")
+        return 1
+
+    log.info(f"<=== End collector task.")
+    return 0
 
 
 @click.command()
@@ -94,6 +128,8 @@ async def main_task():
 def start_server(config_file):
 
     load_config(config_file)
+
+    App.config["train"] = False  # Server does not train - it only predicts therefore explicitly disable train mode
 
     symbol = App.config["symbol"]
     freq = App.config["freq"]
@@ -105,7 +141,7 @@ def start_server(config_file):
         log.error(f"Invalid venue specified in config: {venue}. Error: {e}. Currently these values are supported: {[e.value for e in Venue]}")
         return
     
-    _, data_provider_health_check, sync_data_collector_task = get_collector_functions(venue)
+    fetch_klines_fn, health_check_fn = get_collector_functions(venue)
     trader_funcs = get_trader_functions(venue)
     
     log.info(f"Initializing server. Venue: {venue.value}. Trade pair: {symbol}. Frequency: {freq}")
@@ -120,43 +156,52 @@ def start_server(config_file):
     # Connect to the server and update/initialize the system state
     #
     if venue == Venue.BINANCE:
-        App.client = Client(api_key=App.config["api_key"], api_secret=App.config["api_secret"])
-    
+        # Prepare binance-specific parameters
+        client_params = {}
+        if App.config["append_overlap_records"]:
+            client_params["append_overlap_records"] = App.config["append_overlap_records"]
+        # Prepare binance-specific client arguments
+        client_args = dict(
+            api_key = App.config.get("api_key"),
+            api_secret = App.config.get("api_secret")
+        )
+        client_args = client_args | App.config.get("client_args", {})
+        # Initialize client
+        from intelligent_trading_bot.inputs.collector_binance import init_client
+        init_client(client_params, client_args)
+
     if venue == Venue.MT5:
-        from service.mt5 import connect_mt5
-        authorized = connect_mt5(mt5_account_id=int(App.config.get("mt5_account_id")), mt5_password=str(App.config.get("mt5_password")), mt5_server=str(App.config.get("mt5_server")))
-        if not authorized:
-            log.error(f"Failed to connect to MT5. Check credentials and server details.")
-            return
-        App.client = mt5  
+        # Prepare mt5-specific parameters
+        client_params = {}
+        # Prepare mt5-specific client arguments
+        client_args = dict(
+            mt5_account_id=int(App.config.get("mt5_account_id")),
+            mt5_password=str(App.config.get("mt5_password")),
+            mt5_server=str(App.config.get("mt5_server"))
+        )
+        client_args = client_args | App.config.get("client_args", {})
+        # Initialize client
+        from intelligent_trading_bot.inputs.collector_mt5 import init_client
+        init_client(client_params, client_args)
 
     App.model_store = ModelStore(App.config)
     App.model_store.load_models()
     App.analyzer = Analyzer(App.config, App.model_store)
-    
+
+    # Load latest transaction and (simulated) trade state
+    App.transaction = load_last_transaction()
+
     #App.loop = asyncio.get_event_loop()  # In Python 3.12: DeprecationWarning: There is no current event loop
     App.loop = asyncio.new_event_loop()
 
-    # Do one time server check and state update
-    try:
-        App.loop.run_until_complete(data_provider_health_check())
-    except Exception as e:
-        log.error(f"Problems during health check (connectivity, server etc.) {e}")
-
-    if data_provider_problems_exist():
-        log.error(f"Problems during health check (connectivity, server etc.)")
-        return
-
-    log.info(f"Finished health check (connection, server status etc.)")
-
     # Cold start: load initial data, do complete analysis
     try:
-        App.loop.run_until_complete(sync_data_collector_task())
-        # First call may take some time because of big initial size and hence we make the second call to get the (possible) newest klines
-        App.loop.run_until_complete(sync_data_collector_task())
+        App.loop.run_until_complete(main_collector_task())
+        # The very first call (cold start) may take some time because of big initial size and hence we make the second call to get the (possible) newest klines
+        App.loop.run_until_complete(main_collector_task())
 
-        # Analyze all received data (and not only last few rows) so that we have full history
-        App.analyzer.analyze(ignore_last_rows=True)
+        # Analyze all received data (not only last few rows) so that we have full history
+        App.analyzer.analyze()
     except Exception as e:
         log.error(f"Problems during initial data collection. {e}")
 
@@ -226,10 +271,13 @@ def start_server(config_file):
         # if loop.stop() doesn't immediately halt everything.
         App.loop.close()
         log.info(f"Event loop closed.")
-        # Shutdown MT5 connection if it was initialized
+        if venue == venue.BINANCE:
+            from intelligent_trading_bot.inputs.collector_binance import close_client
+            close_client()
         if venue == Venue.MT5:
-            mt5.shutdown()
-            log.info("MT5 connection shutdown.")
+            from intelligent_trading_bot.inputs.collector_mt5 import close_client
+            close_client()
+        log.info("Connection closed.")
 
     return 0
 

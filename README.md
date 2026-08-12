@@ -53,12 +53,14 @@ Here three arrows mean buy signal for bitcoin at the current price 74,896 and th
 For the signaler service to work, a number of ML models must be trained and the model files available for the service. All scripts run in batch mode by loading some input data and storing some output files. The batch scripts are located in the `scripts` module.
 
 If everything is configured, then the following scripts have to be executed:
-* `python -m scripts.download_binance -c config.json`
+* `python -m scripts.download -c config.json`
 * `python -m scripts.merge -c config.json`
 * `python -m scripts.features -c config.json`
 * `python -m scripts.labels -c config.json`
 * `python -m scripts.train -c config.json`
+* `python -m scripts.predict -c config.json`
 * `python -m scripts.signals -c config.json`
+* `python -m scripts.output -c config.json`
 
 All necessary parameters are provided in the configuration file. The project provides some sample configuration files in the `config` folder.
 
@@ -94,7 +96,7 @@ Here are some pre-defined feature generators (although it is possible to define 
 
 ## Generate labels
 
-This script is similar to feature generation because it adds new columns to the input file. However, these columns describe something that we want to predict and what is not known when executing in online mode. In other words, features are computed from previous (historic) data while labels are computed from future data which are not visible in online mode yet. For example, a label could find maximum price increase during next hour in percent. Computationally it is the same as computing features but this step is separate because we do not need this and cannot compute in online mode. This script will apply all labels defined in the `label_sets` section, add them as new columns and store the result in the output file. Just like for features, not all labels must be really used -- they could be generated for exploratory purposes. The really used labels are listed in the `labels` section.
+This script is similar to feature generation because it adds new columns to the input file. However, these columns describe something that we want to predict and what is not known when executing in online mode. In other words, features are computed from previous (historic) data while labels are computed from future data which are not visible in online mode yet. For example, a label could find maximum price increase during next hour in percent. Computationally it is the same as computing features but this step is separate because we do not need (and cannot compute) this in online mode. This script will apply all labels defined in the `label_sets` section, add them as new columns and store the result in the output file. Just like for features, not all labels must be really used -- they could be generated for exploratory purposes. The really used labels are listed in the `labels` section.
 
 Here are some pre-defined label generators:
 * `highlow` label generator returns True if the price is higher than the specified threshold within some future horizon
@@ -120,7 +122,7 @@ Each previous step adds new columns to the data table with historic (in batch mo
 
 When training ML models we need to find the best hyper-parameters. This is done in some traditional ways and is not explicitly supported by this framework. Yet, even if we find good hyper-parameters this does not guarantee that our trade performance will be good. The ultimate criterion for choosing among various features, labels, ML algorithms and their hyper-parameters is trade performance. Computing real (or close to real) trade performance is supported by the following two scripts working with historic data and helping to estimate trade performance of the whole pipeline. 
 
-The `predict_rolling` script applies prediction to some data (similar to the `predict` script) but does it by regularly re-training ML models. This makes the predictions much more realistic because the models are applied to unseen data only (data which is was not used for training) but the models are regularly re-trained after enough new data was collected. It is precisely what is done in real system but this script applies this to historic data.
+The `predict_rolling` script applies prediction to some data (similar to the `predict` script) but does it by regularly re-training ML models. This makes the predictions much more realistic because the models are applied to unseen data only (data which is was not used for training) but the models are regularly re-trained after enough new data was collected. It is precisely what is done in real system but this script applies this to historic data. The scripts implements rolling walk-forward splits by training the models for each using previous data and applying them for predicting the next predict interval.
 
 The `simulate` script applies some (pre-defined) logic of trading to historic data which includes all data expected in online mode. Essentially, it scans the historic data by applying the trade rules and produces buy-sell transactions which are then aggregated.
 

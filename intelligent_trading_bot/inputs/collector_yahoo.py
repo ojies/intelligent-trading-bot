@@ -1,33 +1,29 @@
 from datetime import datetime, date, timedelta
+from pathlib import Path
+
+import pandas as pd
 
 import click
 
 import yfinance as yf
 from curl_cffi import requests  # Without its Session object, yahoo will reject requests with YFRateLimitError
 
-from intelligent_trading_bot.service.App import *
-
 """
 Download quotes from Yahoo
 """
 
-@click.command()
-@click.option('--config_file', '-c', type=click.Path(), default='', help='Configuration file name')
-def main(config_file):
+def download_klines(config, data_sources):
     """
     """
-    load_config(config_file)
-
-    time_column = App.config["time_column"]
-    data_path = Path(App.config["data_folder"])
-    download_max_rows = App.config.get("download_max_rows", 0)
+    time_column = config["time_column"]
+    data_path = Path(config["data_folder"])
+    download_max_rows = config.get("download_max_rows", 0)
 
     now = datetime.now()
 
     # This session will be used in all requests to avoid YFRateLimitError
     session = requests.Session(impersonate="chrome")
 
-    data_sources = App.config["data_sources"]
     for ds in data_sources:
         # Assumption: folder name is equal to the symbol name we want to download
         quote = ds.get("folder")
@@ -53,12 +49,15 @@ def main(config_file):
             df[time_column] = df[time_column].dt.date
             last_date = df.iloc[-1][time_column]
 
+            overlap = 2  # The overlap can be longer because the difference in days includes also weekends which are not trade days
+            days = (pd.Timestamp(now) - pd.Timestamp(last_date)).days + overlap
+
             # === Download from the remote server
             # Download more data than we need and then overwrite the older data
-            new_df = yf.download(quote, period="5d", auto_adjust=True, multi_level_index=False, session=session)
+            new_df = yf.download(quote, period=f"{days}d", auto_adjust=True, multi_level_index=False, session=session)
 
             new_df = new_df.reset_index()
-            new_df['Date'] = pd.to_datetime(new_df['Date'], format="ISO8601").dt.date
+            new_df['Date'] = pd.to_datetime(new_df['Date'], format="ISO8601", utc=True).dt.date
             #del new_df['Close']
             #new_df.rename({'Adj Close': 'Close'}, axis=1, inplace=True)
             new_df.rename({'Date': time_column}, axis=1, inplace=True)
@@ -75,7 +74,7 @@ def main(config_file):
             df = yf.download(quote, period="max", auto_adjust=True, multi_level_index=False, session=session)
 
             df = df.reset_index()
-            df['Date'] = pd.to_datetime(df['Date'], format="ISO8601").dt.date
+            df['Date'] = pd.to_datetime(df['Date'], format="ISO8601", utc=True).dt.date
             #del df['Close']
             #df.rename({'Adj Close': 'Close'}, axis=1, inplace=True)
             df.rename({'Date': time_column}, axis=1, inplace=True)
@@ -90,13 +89,5 @@ def main(config_file):
             df = df.tail(download_max_rows)
 
         df.to_csv(file_name, index=False)
+
         print(f"Finished downloading '{quote}'. Stored {len(df)} rows in '{file_name}'")
-
-    elapsed = datetime.now() - now
-    print(f"Finished downloading data in {str(elapsed).split('.')[0]}")
-
-    return df
-
-
-if __name__ == '__main__':
-    main()

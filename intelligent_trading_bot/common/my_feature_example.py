@@ -8,7 +8,7 @@ from intelligent_trading_bot.common.model_store import *
 Example of a feature
 """
 
-def my_feature_example(df, config: dict, global_config: dict, model_store: ModelStore):
+def my_feature_example(df, config: dict, global_config: dict, model_store: ModelStore, last_rows: int = 0):
     """
     Add a parameter to the column or multiply by this parameter
     """
